@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""
+SOC detection pipeline simulation for app_logs.json.
+
+Detections:
+1) SQL injection attempts (e.g. '--, OR 1=1)
+2) Brute-force attacks (failed logins per IP above threshold)
+
+Outputs:
+- suspicious IPs
+- number of attempts
+- type of attack
+- severity classification
+- threshold alerts
+- grouped by IP in a readable table
+
+Also prints baseline KQL and Splunk queries for the same detections.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+SQLI_REGEX = re.compile(
+    r"(?:--|/\*|\*/|;|\bor\b\s+1\s*=\s*1\b|\bunion\b\s+\bselect\b|\bdrop\b\s+\btable\b|\binsert\b\s+\binto\b|\bselect\b.+\bfrom\b)",
+    re.IGNORECASE,
+)
+
+DEFAULT_TS_FIELDS = ("timestamp", "time", "attempted_at", "@timestamp", "ts")
+DEFAULT_IP_FIELDS = ("ip", "client_ip", "src_ip", "remote_addr", "source_ip")
+DEFAULT_MESSAGE_FIELDS = ("message", "query", "payload", "username", "path", "request")
+DEFAULT_STATUS_FIELDS = ("status", "result", "event_type", "action", "outcome")
+DEFAULT_SUCCESS_FIELDS = ("success", "ok", "authenticated")
+
+
+@dataclass
+class Detection:
+    ip: str
+    attempts: int
+    attack_type: str
+    severity: str
+    first_seen: str
+    last_seen: str
+    details: str
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Analyze app logs for SQLi and brute-force attacks."
+    )
+    parser.add_argument(
+        "--log-file",
+        default="app_logs.json",
+        help="Path to app logs JSON file (array JSON or JSON lines). Default: app_logs.json",
+    )
+    parser.add_argument(
+        "--start-time",
+        help="Include logs at/after this timestamp (ISO-8601, e.g. 2026-04-13T00:00:00Z)",
+    )
+    parser.add_argument(
+        "--end-time",
+        help="Include logs at/before this timestamp (ISO-8601, e.g. 2026-04-13T23:59:59Z)",
+    )
+    parser.add_argument(
+        "--bruteforce-threshold",
+        type=int,
+        default=5,
+        help="Failed login attempts per IP required to alert (default: 5)",
+    )
+    parser.add_argument(
+        "--print-queries",
+        action="store_true",
+        help="Print generated KQL and Splunk detection queries",
+    )
+    return parser.parse_args()
+
+
+def parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    normalized = value.strip().replace("Z", "+00:00")
+    dt = datetime.fromisoformat(normalized)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def to_iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def parse_event_timestamp(event: dict[str, Any]) -> datetime | None:
+    for key in DEFAULT_TS_FIELDS:
+        if key in event and event[key] is not None:
+            try:
+                return parse_iso_datetime(str(event[key]))
+            except ValueError:
+                continue
+    return None
+
+
+def pick_field(event: dict[str, Any], candidates: tuple[str, ...], default: str = "") -> str:
+    for key in candidates:
+        if key in event and event[key] is not None:
+            return str(event[key])
+    return default
+
+
+def event_ip(event: dict[str, Any]) -> str:
+    return pick_field(event, DEFAULT_IP_FIELDS, default="unknown")
+
+
+def event_text_blob(event: dict[str, Any]) -> str:
+    parts = [pick_field(event, DEFAULT_MESSAGE_FIELDS, default="")]
+    if not parts[0]:
+        parts = [json.dumps(event, separators=(",", ":"), ensure_ascii=True)]
+    return " ".join(parts)
+
+
+def is_failed_login(event: dict[str, Any]) -> bool:
+    status = pick_field(event, DEFAULT_STATUS_FIELDS).lower()
+    if "login_failed" in status or "failed_login" in status:
+        return True
+    if status in {"fail", "failed", "denied", "invalid_credentials"}:
+        return True
+
+    success_raw = None
+    for key in DEFAULT_SUCCESS_FIELDS:
+        if key in event:
+            success_raw = event[key]
+            break
+
+    if isinstance(success_raw, bool):
+        success = success_raw
+    elif success_raw is None:
+        success = None
+    else:
+        success = str(success_raw).strip().lower() in {"true", "1", "yes", "ok", "success"}
+
+    activity_text = (
+        pick_field(event, ("message", "event", "event_name", "action"), default="").lower()
+    )
+    looks_like_login = "login" in activity_text or "auth" in activity_text
+    if looks_like_login and success is False:
+        return True
+
+    if "invalid credentials" in activity_text:
+        return True
+
+    return False
+
+
+def classify_severity(attack_type: str, attempts: int, threshold: int) -> str:
+    if attack_type == "sql_injection":
+        if attempts >= 10:
+            return "high"
+        if attempts >= 4:
+            return "medium"
+        return "low"
+    # brute_force
+    if attempts >= threshold * 3:
+        return "high"
+    if attempts >= threshold * 2:
+        return "medium"
+    return "low"
+
+
+def load_events(path: Path) -> list[dict[str, Any]]:
+    raw = path.read_text(encoding="utf-8").strip()
+    if not raw:
+        return []
+
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return [e for e in parsed if isinstance(e, dict)]
+        if isinstance(parsed, dict):
+            # Handle wrapper shape: {"events":[...]} or single event object.
+            events = parsed.get("events")
+            if isinstance(events, list):
+                return [e for e in events if isinstance(e, dict)]
+            return [parsed]
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: JSONL
+    events: list[dict[str, Any]] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            if isinstance(obj, dict):
+                events.append(obj)
+        except json.JSONDecodeError:
+            continue
+    return events
+
+
+def within_time_window(
+    event_dt: datetime | None, start_dt: datetime | None, end_dt: datetime | None
+) -> bool:
+    if event_dt is None:
+        return start_dt is None and end_dt is None
+    if start_dt and event_dt < start_dt:
+        return False
+    if end_dt and event_dt > end_dt:
+        return False
+    return True
+
+
+def analyze(
+    events: list[dict[str, Any]], start_dt: datetime | None, end_dt: datetime | None, threshold: int
+) -> list[Detection]:
+    sqli_hits: dict[str, list[datetime | None]] = defaultdict(list)
+    brute_hits: dict[str, list[datetime | None]] = defaultdict(list)
+    sqli_samples: dict[str, str] = {}
+
+    for event in events:
+        ts = parse_event_timestamp(event)
+        if not within_time_window(ts, start_dt, end_dt):
+            continue
+
+        ip = event_ip(event)
+        blob = event_text_blob(event)
+
+        if SQLI_REGEX.search(blob):
+            sqli_hits[ip].append(ts)
+            if ip not in sqli_samples:
+                sqli_samples[ip] = blob[:120]
+
+        if is_failed_login(event):
+            brute_hits[ip].append(ts)
+
+    detections: list[Detection] = []
+    for ip, timestamps in sqli_hits.items():
+        known = [t for t in timestamps if t is not None]
+        first_seen = to_iso(min(known)) if known else "n/a"
+        last_seen = to_iso(max(known)) if known else "n/a"
+        attempts = len(timestamps)
+        detections.append(
+            Detection(
+                ip=ip,
+                attempts=attempts,
+                attack_type="sql_injection",
+                severity=classify_severity("sql_injection", attempts, threshold),
+                first_seen=first_seen,
+                last_seen=last_seen,
+                details=f"sample={sqli_samples.get(ip, 'n/a')}",
+            )
+        )
+
+    for ip, timestamps in brute_hits.items():
+        attempts = len(timestamps)
+        if attempts <= threshold:
+            continue
+        known = [t for t in timestamps if t is not None]
+        first_seen = to_iso(min(known)) if known else "n/a"
+        last_seen = to_iso(max(known)) if known else "n/a"
+        detections.append(
+            Detection(
+                ip=ip,
+                attempts=attempts,
+                attack_type="brute_force",
+                severity=classify_severity("brute_force", attempts, threshold),
+                first_seen=first_seen,
+                last_seen=last_seen,
+                details=f"failed_login_threshold>{threshold}",
+            )
+        )
+
+    return sorted(
+        detections,
+        key=lambda d: (d.ip, 0 if d.attack_type == "brute_force" else 1, -d.attempts),
+    )
+
+
+def print_table(rows: list[Detection]) -> None:
+    if not rows:
+        print("No suspicious activity detected for the selected time range.")
+        return
+
+    headers = ["IP", "Attempts", "Attack Type", "Severity", "First Seen", "Last Seen", "Details"]
+    matrix = [
+        [r.ip, str(r.attempts), r.attack_type, r.severity, r.first_seen, r.last_seen, r.details]
+        for r in rows
+    ]
+    widths = [len(h) for h in headers]
+    for row in matrix:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def format_row(cells: list[str]) -> str:
+        return " | ".join(cells[i].ljust(widths[i]) for i in range(len(cells)))
+
+    sep = "-+-".join("-" * w for w in widths)
+    print(format_row(headers))
+    print(sep)
+    for row in matrix:
+        print(format_row(row))
+
+
+def print_alerts(rows: list[Detection]) -> None:
+    if not rows:
+        return
+    print("\nAlerts:")
+    for r in rows:
+        print(
+            f"- [{r.severity.upper()}] {r.attack_type} detected from {r.ip} "
+            f"({r.attempts} attempts, window {r.first_seen} -> {r.last_seen})"
+        )
+
+
+def detection_queries() -> str:
+    return """
+KQL (Microsoft Sentinel / Elastic-style fields may vary):
+---------------------------------------------------------
+// SQL injection detection grouped by IP
+AppLogs
+| where message has_any ("--", " OR 1=1", "UNION SELECT", "DROP TABLE", "/*", "*/")
+| summarize attempts=count(), first_seen=min(timestamp), last_seen=max(timestamp) by ip
+| where attempts > 0
+| order by attempts desc
+
+// Brute-force detection (>5 failed logins per IP)
+AppLogs
+| where (event_type == "login" or action == "login")
+| where success == false or result in ("failed", "invalid_credentials")
+| summarize attempts=count(), first_seen=min(timestamp), last_seen=max(timestamp) by ip
+| where attempts > 5
+| extend severity = case(attempts > 15, "high", attempts > 10, "medium", "low")
+| order by attempts desc
+
+
+Splunk SPL:
+-----------
+// SQL injection detection grouped by IP
+index=app_logs
+| search message="*--*" OR message="* OR 1=1*" OR message="*UNION SELECT*" OR message="*DROP TABLE*" OR message="*/*" OR message="*/*/"
+| stats count as attempts min(_time) as first_seen max(_time) as last_seen by ip
+| convert ctime(first_seen) ctime(last_seen)
+| sort - attempts
+
+// Brute-force detection (>5 failed logins per IP) with severity
+index=app_logs (event_type=login OR action=login)
+| eval failed=if(success="false" OR result="failed" OR result="invalid_credentials",1,0)
+| where failed=1
+| stats count as attempts min(_time) as first_seen max(_time) as last_seen by ip
+| where attempts>5
+| eval severity=case(attempts>15,"high", attempts>10,"medium", true(),"low")
+| convert ctime(first_seen) ctime(last_seen)
+| sort - attempts
+""".strip()
+
+
+def main() -> None:
+    args = parse_args()
+    log_path = Path(args.log_file)
+    if not log_path.exists():
+        raise SystemExit(f"Log file not found: {log_path}")
+
+    try:
+        start_dt = parse_iso_datetime(args.start_time)
+        end_dt = parse_iso_datetime(args.end_time)
+    except ValueError as exc:
+        raise SystemExit(f"Invalid timestamp format: {exc}") from exc
+
+    events = load_events(log_path)
+    detections = analyze(events, start_dt, end_dt, args.bruteforce_threshold)
+
+    print_table(detections)
+    print_alerts(detections)
+
+    if args.print_queries:
+        print("\n" + detection_queries())
+
+
+if __name__ == "__main__":
+    main()
